@@ -8,7 +8,10 @@ from gettestargs import gettestargs
 from hashkey import hashkey
 from math import floor
 # from matplotlib import pyplot as plt
+import multiprocessing
 from scipy import interpolate
+from utils import getImageList, argwrapper
+
 
 args = gettestargs()
 
@@ -19,7 +22,6 @@ gradientsize = 9
 Qangle = 24
 Qstrength = 3
 Qcoherence = 3
-trainpath = 'test'
 
 # Calculate the margin
 maxblocksize = max(patchsize, gradientsize)
@@ -39,26 +41,58 @@ with open(filtername, "rb") as fp:
 weighting = gaussian2d([gradientsize, gradientsize], 2)
 weighting = np.diag(weighting.ravel())
 
-# Get image list
-imagelist = []
-for parent, dirnames, filenames in os.walk(trainpath):
-    for filename in filenames:
-        if filename.lower().endswith(('.bmp', '.dib', '.png', '.jpg', '.jpeg', '.pbm', '.pgm', '.ppm', '.tif', '.tiff')):
-            imagelist.append(os.path.join(parent, filename))
+imagelist = getImageList()
+
+
+def calculateValues(numOfRows, upscaledLR, row, col):
+    if round(row * 100 / numOfRows) \
+            != round((row + 1) * 100 / numOfRows):
+        print('|{sharps}{spaces}|  {percent}%'.format(**{
+            'sharps': '#' * round((row + 1) *
+                                  100 / numOfRows / 2),
+            'spaces': ' ' * (50 - round((row + 1) *
+                                        100 / numOfRows / 2)),
+            'percent': round((row + 1) * 100 / numOfRows)
+        }), end='\r')
+    # Get patch
+    patch = upscaledLR[row - patchmargin: row + patchmargin + 1,
+                       col - patchmargin: col + patchmargin + 1]
+    patch = patch.ravel()
+    # Get gradient block
+    gradientblock = upscaledLR[row - gradientmargin: row + gradientmargin + 1,
+                               col - gradientmargin: col + gradientmargin + 1]
+    # Calculate hashkey
+    angle, strength, coherence = hashkey(gradientblock, Qangle, weighting)
+    # Get pixel type
+    pixeltype = ((row - margin) % R) * R + ((col - margin) % R)
+    return {
+        "row": row - margin,
+        "col": col - margin,
+        "value": patch.dot(h[angle, strength, coherence, pixeltype])
+    }
+
 
 imagecount = 1
 for image in imagelist:
     print('\r', end='')
     print(' ' * 60, end='')
-    print('\rUpscaling image ' + str(imagecount) +
-          ' of ' + str(len(imagelist)) + ' (' + image + ')')
+    print('\rUpscaling image {imagecount} of {len_list} ({image})'.format(**{
+        'imagecount': imagecount,
+        'len_list': len(imagelist),
+        'image': image
+    }))
     origin = cv2.imread(image)
     # Extract only the luminance in YCbCr
     ycrcvorigin = cv2.cvtColor(origin, cv2.COLOR_BGR2YCrCb)
     grayorigin = ycrcvorigin[:, :, 0]
     # Normalized to [0,1]
-    grayorigin = cv2.normalize(grayorigin.astype(
-        'float'), None, grayorigin.min() / 255, grayorigin.max() / 255, cv2.NORM_MINMAX)
+    grayorigin = cv2.normalize(
+        grayorigin.astype('float'),
+        None,
+        grayorigin.min() / 255,
+        grayorigin.max() / 255,
+        cv2.NORM_MINMAX
+    )
     # Upscale (bilinear interpolation)
     heightLR, widthLR = grayorigin.shape
     heightgridLR = np.linspace(0, heightLR - 1, heightLR)
@@ -71,34 +105,18 @@ for image in imagelist:
     # Calculate predictHR pixels
     heightHR, widthHR = upscaledLR.shape
     predictHR = np.zeros((heightHR - 2 * margin, widthHR - 2 * margin))
-    operationcount = 0
-    totaloperations = (heightHR - 2 * margin) * (widthHR - 2 * margin)
-    for row in range(margin, heightHR - margin):
-        for col in range(margin, widthHR - margin):
-            if round(operationcount * 100 / totaloperations) != round((operationcount + 1) * 100 / totaloperations):
-                print('\r|', end='')
-                print('#' * round((operationcount + 1)
-                                  * 100 / totaloperations / 2), end='')
-                print(' ' * (50 - round((operationcount + 1)
-                                        * 100 / totaloperations / 2)), end='')
-                print('|  ' + str(round((operationcount + 1)
-                                        * 100 / totaloperations)) + '%', end='')
-                sys.stdout.flush()
-            operationcount += 1
-            # Get patch
-            patch = upscaledLR[row - patchmargin:row +
-                               patchmargin + 1, col - patchmargin:col + patchmargin + 1]
-            patch = patch.ravel()
-            # Get gradient block
-            gradientblock = upscaledLR[row - gradientmargin:row +
-                                       gradientmargin + 1, col - gradientmargin:col + gradientmargin + 1]
-            # Calculate hashkey
-            angle, strength, coherence = hashkey(
-                gradientblock, Qangle, weighting)
-            # Get pixel type
-            pixeltype = ((row - margin) % R) * R + ((col - margin) % R)
-            predictHR[row - margin, col -
-                      margin] = patch.dot(h[angle, strength, coherence, pixeltype])
+
+    poo = multiprocessing.Pool()
+    funcArgs = [(calculateValues, heightHR - margin,
+                 upscaledLR, row, col)
+                for row in range(margin, heightHR - margin)
+                for col in range(margin, widthHR - margin)]
+    results = poo.map(argwrapper, funcArgs)
+    poo.close()
+    poo.join()
+    for result in results:
+        predictHR[result["row"], result["col"]] = result["value"]
+
     # Scale back to [0,255]
     predictHR = np.clip(predictHR.astype('float') * 255., 0., 255.)
     # Bilinear interpolation on CbCr field
@@ -117,7 +135,7 @@ for image in imagelist:
     result[:, :, 2] = bilinearinterp(widthgridHR, heightgridHR)
     result[margin:heightHR - margin, margin:widthHR - margin, 0] = predictHR
     result = cv2.cvtColor(np.uint8(result), cv2.COLOR_YCrCb2RGB)
-    cv2.imwrite('results  / ' + os.path.splitext(os.path.basename(image))
+    cv2.imwrite('results/' + os.path.splitext(os.path.basename(image))
                 [0] + '_result.bmp', cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
     imagecount += 1
     # Visualizing the process of RAISR image upscaling
