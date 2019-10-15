@@ -8,3 +8,5 @@ __pycache__
 !train/README.md
 !test/README.md
 !results/README.md
+
+.DS_Store
